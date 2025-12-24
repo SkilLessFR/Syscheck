@@ -142,8 +142,8 @@ $Global:InstallerProfiles = @{
             @{ Action = "SendKeys"; Keys = "{TAB}{ENTER}" }
             @{ Action = "SendKeys"; Keys = "{LEFT}{ENTER}" }
             @{ Action = "SendKeys"; Keys = "{TAB}{TAB}{TAB}{TAB}{ENTER}" }
-            @{ Action = "Wait"; Seconds = 120 }
-            @{ Action = "SendKeys"; Keys = "{TAB}{TAB}{TAB}{ENTER}" }
+            @{ Action = "Wait"; Seconds = 140 }
+            @{ Action = "SendKeys"; Keys = "{TAB}{TAB}{ENTER}" }
             @{ Action = "SendKeys"; Keys = "%{F4}" }
 
         )
@@ -168,7 +168,14 @@ $Global:InstallerProfiles = @{
         WindowTitles = @("*MSI Center*")
         TemplateFolder = "msi"
         Steps = @(
-            @{ Action = "Wait"; Seconds = 3 }  # Wait for window to fully load
+            # Wait for MSI Center to auto-launch
+            @{ Action = "Wait"; Seconds = 3 }
+            # Kill the auto-launched MSI Center (runs without admin)
+            @{ Action = "KillProcess"; ProcessName = "MSI Center" }
+            # Launch MSI Center with admin privileges
+            @{ Action = "LaunchProcess"; ProcessPath = "C:\Program Files (x86)\MSI\MSI Center\MSI Center.exe"; WaitAfterLaunch = 5 }
+            # Wait for window to fully load after admin launch
+            @{ Action = "Wait"; Seconds = 3 }
             @{ Action = "SendKeys"; Keys = "{PGDN 21}" }
             @{ Action = "Wait"; Seconds = 2 }  # Wait after scrolling
         )
@@ -191,7 +198,17 @@ $Global:InstallerProfiles = @{
     "GigabyteApp" = @{
         WindowTitles = @("*GIGABYTE*Control*Center*", "*GCC*")
         TemplateFolder = "gigabyte"
-        Steps = @()
+        Steps = @()  # No pre-template steps, go straight to template matching
+        PostTemplateSteps = @(
+            # These steps execute AFTER template matching completes
+            # Kill Ryzen Master installer if it spawns
+            @{action = "Wait"; Seconds = 120 }  # Wait for potential Ryzen Master installer to launch
+            @{ Action = "KillProcessByWindowTitle"; WindowTitle = "*AMD*Ryzen*Master*"; ProcessNameHint = "Setup" }
+            # Wait a bit before killing GCC itself
+            @{ Action = "Wait"; Seconds = 2 }
+            # Kill Gigabyte Control Center process
+            @{ Action = "KillProcess"; ProcessName = "GCC" }
+        )
     }
     "ASRock" = @{
         WindowTitles = @("*ASRock*APP*Shop*", "*APP*Shop*Setup*", "*ASRock*Installer*", "*APPShopSetup(v2.0.0.4)*", "Setup","APPShopSetup(v2.0.0.4).tmp", "*Select Setup Language*", "Select Setup Language", "Setup - APP Shop v2.0.0.4", "Setup/Uninstall (32 bit) (2)","License Agreement")
@@ -202,6 +219,16 @@ $Global:InstallerProfiles = @{
             @{ Action = "SendKeys";Keys = "{ENTER}" }
             @{ Action = "Wait"; Seconds = 60 }
             @{ Action = "Click"; ButtonNames = @("Finish", "Close", "Complete") }
+        )
+    }
+    "Microsoft Office" = @{
+        WindowTitles = @("*Office*", "*Microsoft 365*", "*Office Setup*", "*Microsoft Office*")
+        RequireButtons = $false
+        Steps = @(
+            # Office installer usually runs silently or with minimal UI
+            # Wait for installation to complete
+            @{ Action = "Wait"; Seconds = 120 }
+            @{ Action = "KillProcess"; ProcessName = "OfficeClickToRun","*Office*", "Office Setup*", "Microsoft Office*" }
         )
     }
     "Asustek" = @{
@@ -229,6 +256,48 @@ $Global:InstallerProfiles = @{
 }
 
 # ============================================================================
+# PROCESS HELPER FUNCTIONS
+# ============================================================================
+
+function Test-ProcessRunningAsAdmin {
+    param([string]$ProcessName)
+
+    try {
+        $processes = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
+        foreach ($proc in $processes) {
+            try {
+                $processHandle = $proc.Handle
+                $token = [IntPtr]::Zero
+
+                # Open process token
+                if ([ProcessOps]::OpenProcessToken($processHandle, 0x0008, [ref]$token)) {
+                    $elevationType = 0
+                    $elevationTypeSize = 4
+
+                    # Get token elevation type
+                    if ([ProcessOps]::GetTokenInformation($token, 18, [ref]$elevationType, $elevationTypeSize, [ref]$elevationTypeSize)) {
+                        [ProcessOps]::CloseHandle($token)
+                        # TokenElevationTypeFull = 2 means running as admin
+                        if ($elevationType -eq 2) {
+                            return $true
+                        }
+                    } else {
+                        [ProcessOps]::CloseHandle($token)
+                    }
+                }
+            } catch {
+                # Skip this process and check next one
+                continue
+            }
+        }
+    } catch {
+        return $false
+    }
+
+    return $false
+}
+
+# ============================================================================
 # OCR HELPER FUNCTIONS
 # ============================================================================
 
@@ -239,6 +308,23 @@ function Get-WindowHandleByProcess {
     )
 
     Write-Host "[Get-WindowHandleByProcess] Starting - ProcessId: $ProcessId, Titles: $($WindowTitles -join ', ')" -ForegroundColor Gray
+
+    if (-not ([System.Management.Automation.PSTypeName]'ProcessOps').Type) {
+        Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class ProcessOps {
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, ref IntPtr TokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, ref int TokenInformation, int TokenInformationLength, ref int ReturnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+"@
+    }
 
     if (-not ([System.Management.Automation.PSTypeName]'WindowOps').Type) {
         Add-Type @"
@@ -311,10 +397,10 @@ public class WindowOps {
     $callback = {
         param($hWnd, $lParam)
 
-        # PERFORMANCE: Early exit if we already found a window
-        if ($script:FoundWindows.Count -gt 0) {
-            return $false
-        }
+        # PERFORMANCE: Early exit if we already found a window (disabled for multi-window support)
+        # if ($script:FoundWindows.Count -gt 0) {
+        #     return $false
+        # }
 
         if ([WindowOps]::IsWindowVisible($hWnd)) {
             $length = [WindowOps]::GetWindowTextLength($hWnd)
@@ -352,8 +438,8 @@ public class WindowOps {
 
                     if ($width -gt 0 -and $height -gt 0) {
                         [void]$script:FoundWindows.Add($hWnd)
-                        # PERFORMANCE: Stop enumeration once we find a match
-                        return $false
+                        # Continue enumeration to find ALL matching windows
+                        # return $false
                     }
                 }
             }
@@ -366,8 +452,10 @@ public class WindowOps {
     Write-Host "[Get-WindowHandleByProcess] EnumWindows completed. Found: $($script:FoundWindows.Count) windows" -ForegroundColor Gray
 
     if ($script:FoundWindows.Count -gt 0) {
-        Write-Host "[Get-WindowHandleByProcess] Returning handle: $($script:FoundWindows[0])" -ForegroundColor Gray
-        return $script:FoundWindows[0]
+        # Return the LAST found window (most recently created) instead of the first
+        $selectedHandle = $script:FoundWindows[$script:FoundWindows.Count - 1]
+        Write-Host "[Get-WindowHandleByProcess] Returning LAST handle: $selectedHandle (out of $($script:FoundWindows.Count) windows)" -ForegroundColor Gray
+        return $selectedHandle
     }
     Write-Host "[Get-WindowHandleByProcess] No window found, returning Zero" -ForegroundColor Gray
     return [IntPtr]::Zero
@@ -878,6 +966,7 @@ function Execute-AutoClickerStep {
                 $processes = Get-Process -Name $Step.ProcessName -ErrorAction SilentlyContinue
                 foreach ($proc in $processes) {
                     $proc.Kill()
+                    Write-Host "[KillProcess] Killed process: $($Step.ProcessName)" -ForegroundColor Green
                 }
                 Start-Sleep -Seconds 1
                 return $true
@@ -885,15 +974,82 @@ function Execute-AutoClickerStep {
                 return $true  # Continue even if kill fails
             }
         }
+        "KillProcessByWindowTitle" {
+            try {
+                Write-Host "[KillProcessByWindowTitle] Searching for windows matching: $($Step.WindowTitle)" -ForegroundColor Cyan
+
+                $allProcesses = Get-Process -ErrorAction SilentlyContinue
+                $killedAny = $false
+
+                foreach ($proc in $allProcesses) {
+                    try {
+                        if ($proc.MainWindowTitle -like $Step.WindowTitle) {
+                            # Additional filter by process name hint if provided
+                            if ($Step.ProcessNameHint -and $proc.ProcessName -notlike "*$($Step.ProcessNameHint)*") {
+                                continue
+                            }
+
+                            Write-Host "[KillProcessByWindowTitle] Found matching window: '$($proc.MainWindowTitle)' (Process: $($proc.ProcessName), PID: $($proc.Id))" -ForegroundColor Yellow
+                            $proc.Kill()
+                            Write-Host "[KillProcessByWindowTitle] Killed process: $($proc.ProcessName) (PID: $($proc.Id))" -ForegroundColor Green
+                            $killedAny = $true
+                        }
+                    } catch {
+                        # Skip processes we can't access
+                        continue
+                    }
+                }
+
+                if (-not $killedAny) {
+                    Write-Host "[KillProcessByWindowTitle] No matching windows found" -ForegroundColor Gray
+                }
+
+                Start-Sleep -Seconds 1
+                return $true
+            } catch {
+                Write-Host "[KillProcessByWindowTitle] Error: $($_.Exception.Message)" -ForegroundColor Red
+                return $true  # Continue even if kill fails
+            }
+        }
         "LaunchProcess" {
             try {
                 if (Test-Path $Step.ProcessPath) {
+                    # Extract process name from path
+                    $processName = [System.IO.Path]::GetFileNameWithoutExtension($Step.ProcessPath)
+
+                    Write-Host "[LaunchProcess] Launching $processName with admin privileges..." -ForegroundColor Cyan
                     Start-Process $Step.ProcessPath -Verb RunAs -ErrorAction Stop
-                    Start-Sleep -Seconds $Step.WaitAfterLaunch
-                    return $true
+
+                    # Wait for process to launch and verify it's running as admin
+                    $waitTime = if ($Step.WaitAfterLaunch) { $Step.WaitAfterLaunch } else { 5 }
+                    $maxWaitTime = 30  # Maximum 30 seconds to wait for admin process
+                    $elapsedTime = 0
+                    $checkInterval = 1  # Check every 1 second
+
+                    Write-Host "[LaunchProcess] Waiting for $processName to launch as admin (timeout: ${maxWaitTime}s)..." -ForegroundColor Yellow
+
+                    while ($elapsedTime -lt $maxWaitTime) {
+                        Start-Sleep -Seconds $checkInterval
+                        $elapsedTime += $checkInterval
+
+                        # Check if process is running as admin
+                        if (Test-ProcessRunningAsAdmin -ProcessName $processName) {
+                            Write-Host "[LaunchProcess] $processName is now running as admin (took ${elapsedTime}s)" -ForegroundColor Green
+                            # Wait the remaining configured time if needed
+                            $remainingWait = $waitTime - $elapsedTime
+                            if ($remainingWait -gt 0) {
+                                Start-Sleep -Seconds $remainingWait
+                            }
+                            return $true
+                        }
+                    }
+
+                    Write-Host "[LaunchProcess] WARNING: $processName did not launch as admin within ${maxWaitTime}s" -ForegroundColor Red
+                    return $false
                 }
                 return $false
             } catch {
+                Write-Host "[LaunchProcess] Error: $($_.Exception.Message)" -ForegroundColor Red
                 return $false
             }
         }
@@ -1350,11 +1506,13 @@ function Start-AutoClickerForInstallers {
 
                         # Re-find window if RefindWindowEachStep is enabled (for multi-window installers)
                         if ($profile.RefindWindowEachStep) {
-                            $newWindowHandle = Get-WindowHandleByProcess -ProcessId $process.Id -WindowTitles $profile.WindowTitles
+                            $newWindowHandle = Get-WindowHandleByProcess -ProcessId $installer.ProcessId -WindowTitles $profile.WindowTitles
                             if ($newWindowHandle -ne [IntPtr]::Zero -and $newWindowHandle -ne $installer.WindowHandle) {
                                 Write-Host "[$($installer.VendorType)] Switched to new window (Handle: $newWindowHandle)" -ForegroundColor Cyan
                                 $installer.WindowHandle = $newWindowHandle
                                 $windowHandle = $newWindowHandle
+                                # Give the new window time to fully render
+                                Start-Sleep -Milliseconds 500
                             }
                         }
 
@@ -1370,6 +1528,16 @@ function Start-AutoClickerForInstallers {
                         if (-not (Test-Path $templatePath)) {
                             Write-Host "[$($installer.VendorType)] Template Phase: No more templates found (looking for: $templateName.png in $subfolderPath)" -ForegroundColor Cyan
                             Write-Host "[$($installer.VendorType)] Template Phase completed!" -ForegroundColor Green
+
+                            # Check if there are PostTemplateSteps to execute
+                            if ($profile.PostTemplateSteps -and $profile.PostTemplateSteps.Count -gt 0) {
+                                Write-Host "[$($installer.VendorType)] Starting Post-Template Steps ($($profile.PostTemplateSteps.Count) steps)..." -ForegroundColor Cyan
+                                $installer.TemplatePhaseStarted = $false  # Exit template phase
+                                $installer.PostTemplatePhaseStarted = $true
+                                $installer.CurrentStep = 0  # Reset to start post-template steps
+                                continue
+                            }
+
                             $installer.Completed = $true
                             continue
                         }
@@ -1448,6 +1616,36 @@ function Start-AutoClickerForInstallers {
                         continue
                     }
 
+                    # ========== PHASE 3: POST-TEMPLATE STEPS ==========
+                    if ($installer.PostTemplatePhaseStarted) {
+                        if ($installer.CurrentStep -ge $profile.PostTemplateSteps.Count) {
+                            Write-Host "[$($installer.VendorType)] Post-Template Steps completed!" -ForegroundColor Green
+                            $installer.Completed = $true
+                            continue
+                        }
+
+                        $currentStep = $profile.PostTemplateSteps[$installer.CurrentStep]
+                        Write-Host "[$($installer.VendorType)] Post-Template Step $($installer.CurrentStep + 1)/$($profile.PostTemplateSteps.Count): $($currentStep.Action)" -ForegroundColor Cyan
+
+                        try {
+                            if (Execute-AutoClickerStep -Step $currentStep -Window $null -WindowHandle $installer.WindowHandle -ShowDebug $false) {
+                                Write-Host "[$($installer.VendorType)] Post-Template Step $($installer.CurrentStep + 1) completed" -ForegroundColor Green
+                                $installer.CurrentStep++
+                            } else {
+                                Write-Host "[$($installer.VendorType)] Post-Template Step $($installer.CurrentStep + 1) failed, continuing anyway..." -ForegroundColor Yellow
+                                $installer.CurrentStep++
+                            }
+                        } catch {
+                            Write-Host "[$($installer.VendorType)] Post-Template Step error: $($_.Exception.Message)" -ForegroundColor Red
+                            $installer.CurrentStep++
+                        }
+
+                        $installer.LastAction = (Get-Date)
+                        Start-Sleep -Milliseconds 500
+                        $loopCount++
+                        continue
+                    }
+
                     # ========== PHASE 1: PRE-PROGRAMMED STEPS ==========
                     $currentStep = $profile.Steps[$installer.CurrentStep]
                     if (((Get-Date) - $installer.LastAction).TotalSeconds -lt 0.3) { continue }
@@ -1477,7 +1675,8 @@ function Start-AutoClickerForInstallers {
                     # NOTE: SendKeys DOES need UI Automation window to call SetFocus()
                     $needsUIAutomation = ($currentStep.Action -ne "ClickOCR" -and $currentStep.Action -ne "ClickCoordinates" -and
                                           $currentStep.Action -ne "ClickTemplate" -and $currentStep.Action -ne "Wait" -and
-                                          $currentStep.Action -ne "KillProcess" -and $currentStep.Action -ne "LaunchProcess")
+                                          $currentStep.Action -ne "KillProcess" -and $currentStep.Action -ne "KillProcessByWindowTitle" -and
+                                          $currentStep.Action -ne "LaunchProcess")
 
                     if ($needsUIAutomation) {
                         foreach ($windowTitle in $profile.WindowTitles) {
@@ -1506,7 +1705,8 @@ function Start-AutoClickerForInstallers {
                     # SendKeys DOES need a window, so it's not in this list
                     if ($currentStep.Action -eq "ClickOCR" -or $currentStep.Action -eq "ClickCoordinates" -or
                         $currentStep.Action -eq "ClickTemplate" -or $currentStep.Action -eq "Wait" -or
-                        $currentStep.Action -eq "KillProcess" -or $currentStep.Action -eq "LaunchProcess" -or $window) {
+                        $currentStep.Action -eq "KillProcess" -or $currentStep.Action -eq "KillProcessByWindowTitle" -or
+                        $currentStep.Action -eq "LaunchProcess" -or $window) {
                         # REMOVED DEBUG POPUP HERE
                         try {
                             Write-Host "[DEBUG] Executing step $($installer.CurrentStep + 1): $($currentStep.Action)" -ForegroundColor DarkGray
@@ -2174,6 +2374,11 @@ function Invoke-DriverInstallation {
     }
 
     if ($requiredInstallers.Count -gt 0) {
+        Write-Host "[Driver Installation] Found $($requiredInstallers.Count) required installers:" -ForegroundColor Cyan
+        foreach ($inst in $requiredInstallers) {
+            Write-Host "  - $($inst.DisplayName) ($($inst.DeviceType))" -ForegroundColor Gray
+        }
+
         $buttonCheck.Enabled = $false; $buttonActivate.Enabled = $false; $buttonFinalize.Enabled = $false
         if ($buttonInstallDrivers) { $buttonInstallDrivers.Enabled = $false }
         if ($buttonOptionalInstallers) { $buttonOptionalInstallers.Enabled = $false }
@@ -2234,6 +2439,77 @@ function Find-IdFromUsb {
     }
     catch { }
     return $null
+}
+
+function Check-UsbIdForOffice {
+    try {
+        Write-Host "[USB Check] Checking diaxxa_id.txt for Office indicator..." -ForegroundColor Cyan
+        $usbDrives = Get-Volume | Where-Object { $_.DriveType -eq 'Removable' -and $_.DriveLetter }
+
+        if (-not $usbDrives) {
+            Write-Host "[USB Check] No removable USB drives found" -ForegroundColor Yellow
+            return $false
+        }
+
+        foreach ($drive in $usbDrives) {
+            $idFilePath = Join-Path -Path ($drive.DriveLetter + ":\") -ChildPath "diaxxa_id.txt"
+            if (Test-Path $idFilePath) {
+                $idContent = Get-Content -Path $idFilePath | Select-Object -First 1
+                $trimmedId = $idContent.Trim()
+
+                Write-Host "[USB Check] Found diaxxa_id.txt on drive $($drive.DriveLetter): with content: '$trimmedId'" -ForegroundColor Cyan
+
+                # Check for "+Office" (with or without space before the plus)
+                if ($trimmedId -and ($trimmedId -like "*+Office*" -or $trimmedId -like "*+ Office*")) {
+                    Write-Host "[USB Check] ID contains '+Office': $trimmedId" -ForegroundColor Green
+                    return $true
+                }
+            }
+        }
+
+        Write-Host "[USB Check] No diaxxa_id.txt found with '+Office' in content" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Host "[USB Check] Error checking USB ID file: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    return $false
+}
+
+function Add-OfficeToDriverInstallation {
+    # Check if Office is already in the installer queue as non-optional
+    $officeAlreadyRequired = $Global:InstallerQueue | Where-Object { $_.DisplayName -like "*Office*" -and $_.IsOptional -eq $false }
+
+    if ($officeAlreadyRequired) {
+        Write-Host "[Office Auto-Add] Office is already in the required installer queue" -ForegroundColor Cyan
+        return
+    }
+
+    # Find Office in optional installers and make it required
+    $officeInstaller = $Global:InstallerQueue | Where-Object { $_.DisplayName -like "*Office*" -and $_.IsOptional -eq $true }
+
+    if ($officeInstaller) {
+        Write-Host "[Office Auto-Add] Moving Office from optional to required installers" -ForegroundColor Green
+        $officeInstaller.IsOptional = $false
+    } else {
+        Write-Host "[Office Auto-Add] Office installer not found in queue, attempting to add..." -ForegroundColor Yellow
+
+        # Try to find Office installer
+        $officeInstallerFolderPath = Join-Path $script:PSScriptRoot "OptionalInstallers\Office"
+        $officeInstallerPath = Get-InstallerPath -BasePath $officeInstallerFolderPath -ManufacturerOrVendorOrFolder "."
+
+        if ($officeInstallerPath) {
+            Write-Host "[Office Auto-Add] Adding Office to required installers from: $officeInstallerPath" -ForegroundColor Green
+            $Global:InstallerQueue.Add(@{
+                InstallerPath = $officeInstallerPath
+                DisplayName = "Microsoft Office"
+                DeviceType = "Software"
+                IsOptional = $false
+                RunFunction = $null
+            })
+        } else {
+            Write-Host "[Office Auto-Add] Office installer not found at: $officeInstallerFolderPath" -ForegroundColor Red
+        }
+    }
 }
 
 function Check-GpuApp {
@@ -4173,6 +4449,12 @@ $form.Add_Shown({
             Update-Status "ID '$foundId' loaded automatically from USB." $global:colorInfo
         })
     }
+
+    # Check if USB ID contains "+ Office" and add Office to driver installation
+    if (Check-UsbIdForOffice) {
+        Add-OfficeToDriverInstallation
+        Update-Status "USB ID contains '+ Office' - Office added to driver installation." $global:colorInfo
+    }
     Update-Status "Detecting hardware..." $global:colorChecking; $form.Refresh()
     $motherboard = Get-MotherboardInfo
     if ($motherboard) {
@@ -4229,6 +4511,12 @@ $form.Add_Shown({
             $textBoxIdInput.Text = $allItems[0].id
             $global:SoftwareToActivate = $allItems[0].softwareType
             Update-Status "Single matching ID found and set automatically." $global:colorSuccess
+
+            # Check if USB ID contains "+ Office" and add Office to driver installation
+            if (Check-UsbIdForOffice) {
+                Add-OfficeToDriverInstallation
+                Update-Status "USB ID contains '+ Office' - Office added to driver installation." $global:colorInfo
+            }
         }
         elseif ($allItems.Count -gt 1) {
             $selectedItem = Show-IdSelectionDialog -Matches $idResponse
@@ -4236,6 +4524,12 @@ $form.Add_Shown({
                 $textBoxIdInput.Text = $selectedItem.id
                 $global:SoftwareToActivate = $selectedItem.softwareType
                 Update-Status "ID selected by user." $global:colorInfo
+
+                # Check if USB ID contains "+ Office" and add Office to driver installation
+                if (Check-UsbIdForOffice) {
+                    Add-OfficeToDriverInstallation
+                    Update-Status "USB ID contains '+ Office' - Office added to driver installation." $global:colorInfo
+                }
             }
             else {
                 Update-Status "User cancelled ID selection. Please enter manually." $global:colorWarning
